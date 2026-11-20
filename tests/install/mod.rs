@@ -21,11 +21,12 @@ fi
 [ "$1" = -s ] && [ "$2" = "usb-$PHONE" ] || exit 72
 shift 2
 case "$1 $2 $3" in
-  "shell test -r") case "$CASE" in adbpull|partitionchange) [ "$4" = /dev/block/by-name/vendor_boot_a ] || exit 1;; *) exit 1;; esac;;
-  "pull /dev/block/by-name/vendor_boot_a "*) /bin/cp "$FIXTURE/fw/vendor_boot.img" "$3";;
+  "shell test -r") case "$CASE" in adbpull|adbstream|unknownadb|partitionchange) [ "$4" = /dev/block/by-name/vendor_boot_a ] || exit 1;; *) exit 1;; esac;;
+  "shell -T cat") [ "$CASE" = adbstream ] || exit 1; /bin/cat "$FIXTURE/fw/vendor_boot.img";;
+  "pull /dev/block/by-name/vendor_boot_a "*) [ "$CASE" != adbstream ] || exit 1; /bin/cp "$FIXTURE/fw/vendor_boot.img" "$3";;
   "shell getprop ")
     locked=0; state=unlocked; verified=orange; current=_a; debug=0
-    case "$CASE" in locked) locked=1; state=locked; verified=green;; readback|noop) debug=1;; esac
+    case "$CASE" in unknownadb) locked=""; state=""; verified="";; locked) locked=1; state=locked; verified=green;; readback|noop) debug=1;; esac
     case "$mode:$CASE" in rebooted:fallbackslot) current=_b;; esac
     case "$CASE" in singleslot) current="";; esac
     echo "[ro.serialno]: [$PHONE]"
@@ -66,7 +67,7 @@ case "$1" in
       unlocked) if [ "$CASE" = fastlocked ]; then val=no; else val=yes; fi;;
       current-slot) case "$CASE" in slotchange) val=b;; singleslot) unknown;; *) val=a;; esac;;
       is-userspace) if [ "$mode" = fbdev ]; then val=yes; else val=no; fi;;
-      max-fetch-size) case "$CASE" in readback|noop) val=0x800000;; *) unknown;; esac;;
+      max-fetch-size) case "$CASE:$mode" in readback:*|noop:*|alternate:fbdev) val=0x800000;; *) unknown;; esac;;
       has-slot:*) case "$CASE" in singleslot|partitionchange) val=no;; *) val=yes;; esac;;
       partition-size:*)
         case "$2" in *vendor_kernel_boot_a|*vendor_boot_a|*init_boot_a|*vendor_boot) val=0x4000000;; *) val=0;; esac
@@ -81,7 +82,7 @@ case "$1" in
     [ "$mode" = bl ] || exit 76
     if [ "$CASE" = flashfail ]; then echo "FAILED (remote: 'write failed')" >&2; exit 1; fi
     /bin/cp "$3" "$FIXTURE/flashed.img"; echo "$2" > "$FIXTURE/target";;
-  reboot) if [ "$2" = bootloader ]; then echo bl > "$FIXTURE/mode"; else echo rebooted > "$FIXTURE/mode"; fi;;
+  reboot) case "$2" in bootloader) echo bl > "$FIXTURE/mode";; fastboot) [ "$CASE" = alternate ] || unknown; echo fbdev > "$FIXTURE/mode";; *) echo rebooted > "$FIXTURE/mode";; esac;;
   *) exit 75;;
 esac
 "#;
@@ -395,4 +396,159 @@ fn explicit_init_boot_uses_read_only_vendor_references() {
         fs::read(test.root.path().join("fw/vendor_boot.img")).unwrap(),
         factory(false)
     );
+}
+
+// The desktop passes absolute tool paths and uses callbacks on a background thread.
+// Each fake tool obtains its own fixture from its path, so tests can run concurrently.
+impl Harness {
+    fn gui_tools(&self, case: &str) -> enensu::device::PlatformTools {
+        let dir = self.root.path();
+        fs::write(dir.join("mode"), "android\n").unwrap();
+        for (name, body) in [("adb.exe", ADB), ("fastboot.exe", FASTBOOT)] {
+            let prelude =
+                format!("#!/bin/sh\nFIXTURE=${{0%/*}}\nPHONE=${{FIXTURE##*/}}\nCASE={case}\n");
+            script(
+                dir,
+                name,
+                &(prelude + body.strip_prefix("#!/bin/sh\n").unwrap()),
+            );
+        }
+        enensu::device::PlatformTools::in_directory(dir)
+    }
+
+    fn gui_options(&self) -> enensu::install::Options {
+        let dir = self.root.path();
+        enensu::install::Options::for_desktop(
+            format!("usb-{}", self.serial),
+            vec![dir.join("sensor.ko")],
+            None,
+            dir.join("saved images"),
+        )
+    }
+}
+
+#[test]
+fn desktop_lists_unauthorized_devices_without_querying_their_properties() {
+    let dir = tempdir().unwrap();
+    script(
+        dir.path(),
+        "adb.exe",
+        r#"#!/bin/sh
+case "$*" in
+  'devices -l') echo 'List of devices attached'; echo 'ready device model:Pixel_7'; echo 'waiting unauthorized'; echo 'gone offline';;
+  '-s ready shell getprop') echo '[ro.product.model]: [Pixel 7]'; echo '[ro.boot.flash.locked]: [1]'; echo '[ro.boot.slot_suffix]: [_b]';;
+  '-s ready shell uname -r') echo '6.1.0-test';;
+  *) touch "${0%/*}/unexpected-call"; exit 23;;
+esac
+"#,
+    );
+    let rows = enensu::device::PlatformTools::in_directory(dir.path())
+        .devices()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        (
+            &*rows[0].model,
+            &*rows[0].kernel,
+            &*rows[0].slot,
+            rows[0].lock
+        ),
+        ("Pixel 7", "6.1.0-test", "b", Some(true))
+    );
+    assert_eq!(
+        (&*rows[1].state, &*rows[2].state),
+        ("unauthorized", "offline")
+    );
+    assert!(!dir.path().join("unexpected-call").exists());
+}
+
+#[test]
+fn desktop_events_follow_the_actual_write_and_distinguish_restricted_verification() {
+    use enensu::{
+        device::Verification,
+        install::{Progress, run_with},
+    };
+    let test = Harness::new();
+    let tools = test.gui_tools("hidden");
+    let mut events = Vec::new();
+    let verdict = run_with(
+        test.gui_options(),
+        tools,
+        |event| match event {
+            Progress::FirmwareNeeded(_) => events.push("request"),
+            Progress::Saved { source, image } => {
+                assert!(source.is_file() && image.is_file());
+                events.push("saved");
+            }
+            Progress::Flashing(target) => {
+                assert_eq!(target, "vendor_boot_a");
+                events.push("writing");
+            }
+            Progress::Written(_) => {
+                assert!(test.root.path().join("flashed.img").exists());
+                events.push("written");
+            }
+            Progress::Rebooting => events.push("reboot"),
+            Progress::Verifying => events.push("verify"),
+            _ => (),
+        },
+        |_, build| {
+            assert_eq!(build, "test/build/current");
+            Ok(test.root.path().join("fw/vendor_boot.img"))
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        events,
+        ["request", "saved", "writing", "written", "reboot", "verify"]
+    );
+    assert_eq!(verdict, Verification::Unverified);
+}
+
+#[test]
+fn cancelling_the_desktop_firmware_prompt_returns_to_android_without_writing() {
+    let test = Harness::new();
+    let result = enensu::install::run_with(
+        test.gui_options(),
+        test.gui_tools("factory"),
+        |_| {},
+        |_, _| anyhow::bail!("cancelled in GUI"),
+    );
+    assert!(result.unwrap_err().to_string().contains("cancelled in GUI"));
+    assert_eq!(test.read("mode"), "rebooted\n");
+    assert!(!test.root.path().join("flashed.img").exists());
+}
+
+#[test]
+fn desktop_reads_a_permitted_block_stream_or_a_second_fastboot_mode_without_local_firmware() {
+    use enensu::{
+        device::Verification,
+        install::{Progress, run_with},
+    };
+    for (case, expected) in [
+        ("adbstream", "adb shell"),
+        ("alternate", "fastboot fetch"),
+        ("unknownadb", "adb pull"),
+    ] {
+        let test = Harness::new();
+        let mut selected = None;
+        let result = run_with(
+            test.gui_options(),
+            test.gui_tools(case),
+            |event| {
+                if let Progress::ImageSource { target, via } = event {
+                    selected = Some((target.to_owned(), via.unwrap().to_owned()));
+                }
+            },
+            |_, _| panic!("working device readback unexpectedly requested local firmware"),
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            Some(("vendor_boot_a".to_owned(), expected.to_owned()))
+        );
+        assert_eq!(result, Verification::Loaded);
+        assert_eq!(test.saved("vendor_boot-source.img"), factory(false));
+        assert_eq!(test.read("target"), "vendor_boot_a\n");
+    }
 }

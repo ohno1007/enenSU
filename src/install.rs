@@ -1,4 +1,7 @@
-use crate::{device::Device, image, modules};
+use crate::{
+    device::{Device, PlatformTools, Readback, Verification},
+    image, modules,
+};
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 use std::{
@@ -47,6 +50,26 @@ pub struct Options {
 }
 
 impl Options {
+    pub fn for_desktop(
+        serial: String,
+        modules: Vec<PathBuf>,
+        firmware: Option<PathBuf>,
+        output_dir: PathBuf,
+    ) -> Self {
+        Self {
+            modules,
+            firmware,
+            partition: None,
+            serial: Some(serial),
+            fragment: None,
+            vendor_boot_fragment: None,
+            module_dir: None,
+            output_dir,
+            timeout: 180,
+            no_dialog: false,
+        }
+    }
+
     fn desktop(&self) -> bool {
         !self.no_dialog
             && (cfg!(any(windows, target_os = "macos"))
@@ -84,11 +107,34 @@ impl Options {
     }
 }
 
+pub enum Progress<'a> {
+    Checking,
+    Connected(&'a str),
+    Reading,
+    Patching(&'a str),
+    Fastboot,
+    FirmwareNeeded(&'a str),
+    ReadbackMode,
+    ImageSource {
+        target: &'a str,
+        via: Option<&'a str>,
+    },
+    Saved {
+        source: &'a Path,
+        image: &'a Path,
+    },
+    Flashing(&'a str),
+    Written(&'a str),
+    Skipped(&'a str),
+    Rebooting,
+    Verifying,
+}
+
 #[derive(Default)]
 struct Firmware {
     images: BTreeMap<String, PathBuf>,
     selected: Option<String>,
-    origins: BTreeMap<String, String>,
+    origins: BTreeMap<String, Readback>,
     live: bool,
 }
 
@@ -143,7 +189,7 @@ impl Firmware {
         phone: &Device,
         opts: &Options,
         dir: &Path,
-        mut read: impl FnMut(&str, &Path) -> Result<Option<String>>,
+        mut read: impl FnMut(&str, &Path) -> Result<Option<Readback>>,
     ) -> Result<()> {
         for name in PARTITIONS {
             if self.images.contains_key(name) {
@@ -209,7 +255,10 @@ impl Firmware {
             }
             println!("Reading {physical} using fastboot fetch…");
             match phone.fetch(&physical, file) {
-                Ok(()) => Ok(Some(physical)),
+                Ok(()) => Ok(Some(Readback {
+                    partition: physical,
+                    via: "fastboot fetch",
+                })),
                 Err(e) => {
                     eprintln!("Readback unavailable for {physical}: {e}");
                     Ok(None)
@@ -265,7 +314,12 @@ impl Firmware {
         Ok(())
     }
 
-    fn prepare(&self, phone: &Device, opts: &Options) -> Result<Option<Prepared>> {
+    fn prepare(
+        &self,
+        phone: &Device,
+        opts: &Options,
+        emit: &mut impl FnMut(Progress),
+    ) -> Result<Option<Prepared>> {
         for name in PARTITIONS {
             if self
                 .selected
@@ -338,6 +392,7 @@ impl Firmware {
                     .get("vendor_kernel_boot")
                     .map(PathBuf::as_path);
             }
+            emit(Progress::Patching(name));
             let patched = match image::patch(
                 &source,
                 &opts.modules,
@@ -365,7 +420,7 @@ struct Prepared {
     partition: &'static str,
     source: Vec<u8>,
     patched: Option<Vec<u8>>,
-    read_from: Option<String>,
+    read_from: Option<Readback>,
 }
 
 impl Prepared {
@@ -393,14 +448,40 @@ impl Prepared {
     }
 }
 
-fn local_image(path: &Path, phone: &Device, opts: &Options) -> Result<Prepared> {
-    Firmware::local(path, opts.partition.as_deref())?.prepare(phone, opts)?
+fn local_image(
+    path: &Path,
+    phone: &Device,
+    opts: &Options,
+    emit: &mut impl FnMut(Progress),
+) -> Result<Prepared> {
+    Firmware::local(path, opts.partition.as_deref())?.prepare(phone, opts, emit)?
         .context("no matching normal-boot module lists. Select the partition that owns modules.load and modules.dep, or supply an extracted firmware directory")
 }
 
-pub fn run(mut opts: Options) -> Result<()> {
+pub fn run(opts: Options) -> Result<()> {
+    run_with(
+        opts,
+        PlatformTools::default(),
+        |_| {},
+        |opts, _| opts.pick_firmware(),
+    )
+    .map(|_| ())
+}
+
+pub fn run_with(
+    mut opts: Options,
+    tools: PlatformTools,
+    mut emit: impl FnMut(Progress),
+    mut pick_firmware: impl FnMut(&Options, &str) -> Result<PathBuf>,
+) -> Result<Verification> {
+    emit(Progress::Checking);
     opts.pick_modules()?;
-    let phone = Device::connect(opts.serial.as_deref(), Duration::from_secs(opts.timeout))?;
+    let phone = Device::connect(
+        opts.serial.as_deref(),
+        Duration::from_secs(opts.timeout),
+        tools,
+    )?;
+    emit(Progress::Connected(&phone.serial));
     let working = TempDir::new()?;
     let mut names = Vec::new();
     for (index, file) in opts.modules.iter_mut().enumerate() {
@@ -426,17 +507,19 @@ pub fn run(mut opts: Options) -> Result<()> {
         live: true,
         ..Firmware::default()
     };
+    emit(Progress::Reading);
     let local = if let Some(path) = opts.firmware.as_deref() {
-        Some(local_image(path, &phone, &opts)?)
+        Some(local_image(path, &phone, &opts, &mut emit)?)
     } else {
         live.read_available(&phone, &opts, working.path(), |part, file| {
             phone.pull_image(part, file)
         })?;
-        live.prepare(&phone, &opts)?
+        live.prepare(&phone, &opts, &mut emit)?
     };
+    emit(Progress::Fastboot);
     phone.reboot_from_android(local.is_none())?;
     let mut return_to_android = true;
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<Verification> {
         let initial_slot = phone.verify_target()?;
         // If Android did not disclose its slot but fastboot found one, reacquire
         // any unqualified block reads with the now-confirmed slot.
@@ -451,18 +534,30 @@ pub fn run(mut opts: Options) -> Result<()> {
             Some(image) => image,
             None => {
                 live.fetch(&phone, &opts, working.path(), initial_slot.as_deref())?;
-                match live.prepare(&phone, &opts)? {
+                let mut found = live.prepare(&phone, &opts, &mut emit)?;
+                if found.is_none() && phone.alternate_readback_mode()? {
+                    emit(Progress::ReadbackMode);
+                    ensure!(
+                        phone.verify_target()? == initial_slot,
+                        "active slot changed during device readback"
+                    );
+                    live.fetch(&phone, &opts, working.path(), initial_slot.as_deref())?;
+                    found = live.prepare(&phone, &opts, &mut emit)?;
+                }
+                match found {
                     Some(image) => image,
                     None => {
+                        let build = phone
+                            .props
+                            .get("ro.build.fingerprint")
+                            .map(String::as_str)
+                            .unwrap_or("unknown");
+                        emit(Progress::FirmwareNeeded(build));
                         println!(
                             "Select a factory image matching this device build: {}",
-                            phone
-                                .props
-                                .get("ro.build.fingerprint")
-                                .map(String::as_str)
-                                .unwrap_or("unknown")
+                            build
                         );
-                        local_image(&opts.pick_firmware()?, &phone, &opts)?
+                        local_image(&pick_firmware(&opts, build)?, &phone, &opts, &mut emit)?
                     }
                 }
             }
@@ -476,10 +571,15 @@ pub fn run(mut opts: Options) -> Result<()> {
         let (target, capacity) = phone.destination(prepared.partition, current.as_deref(), true)?;
         if let Some(read_from) = &prepared.read_from {
             ensure!(
-                read_from == &target,
-                "read back {read_from}, but the bootloader resolved the destination to {target}"
+                read_from.partition == target,
+                "read back {}, but the bootloader resolved the destination to {target}",
+                read_from.partition
             );
         }
+        emit(Progress::ImageSource {
+            target: &target,
+            via: prepared.read_from.as_ref().map(|r| r.via),
+        });
         let length = prepared.patched.as_ref().unwrap_or(&prepared.source).len() as u64;
         ensure!(
             capacity.is_none_or(|size| length <= size),
@@ -487,11 +587,18 @@ pub fn run(mut opts: Options) -> Result<()> {
         );
         if prepared.read_from.is_some() && prepared.patched.is_none() {
             println!("{target} already contains the selected drivers. Skipping the write.");
+            emit(Progress::Skipped(&target));
+            emit(Progress::Rebooting);
             phone.reboot()?;
             return_to_android = false;
+            emit(Progress::Verifying);
             return phone.verify_boot(&names, current.as_deref());
         }
         let (source, image) = prepared.save(&opts.output_dir)?;
+        emit(Progress::Saved {
+            source: &source,
+            image: &image,
+        });
         println!(
             "{}: {}\nPrepared image: {}",
             if prepared.read_from.is_some() {
@@ -503,6 +610,7 @@ pub fn run(mut opts: Options) -> Result<()> {
             image.display()
         );
         println!("Flashing {target} on {}…", phone.serial);
+        emit(Progress::Flashing(&target));
         return_to_android = false;
         phone.flash(&target, &image).with_context(|| {
             format!(
@@ -510,10 +618,13 @@ pub fn run(mut opts: Options) -> Result<()> {
                 source.display()
             )
         })?;
+        emit(Progress::Written(&target));
         println!("fastboot confirmed the write to {target}.");
+        emit(Progress::Rebooting);
         phone
             .reboot()
             .context("image written. The reboot request failed")?;
+        emit(Progress::Verifying);
         phone
             .verify_boot(&names, current.as_deref())
             .with_context(|| {

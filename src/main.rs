@@ -1,12 +1,6 @@
-mod archive;
-mod avb;
-mod device;
-mod image;
-mod install;
-mod modules;
-
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
+use enensu::{image, install};
 use std::{fs, io::Write, path::PathBuf, process::Command};
 
 #[derive(Parser)]

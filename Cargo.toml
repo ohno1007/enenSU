@@ -1,7 +1,8 @@
 [package]
 name = "enensu"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+default-run = "enensu"
 license = "GPL-3.0-only"
 description = "Patch optional kernel modules into Android first-stage boot ramdisks"
 
@@ -18,3 +19,21 @@ tinyfiledialogs = "3.9.1"
 [dev-dependencies]
 flate2 = "1"
 object = { version = "0.41", default-features = false, features = ["write_std", "elf"] }
+
+[features]
+desktop = ["dep:tao", "dep:wry", "dep:serde_json", "dep:zip", "dep:dirs", "dep:embed-resource"]
+
+[target.'cfg(windows)'.dependencies]
+tao = { version = "0.37", optional = true }
+wry = { version = "0.57", default-features = false, features = ["os-webview"], optional = true }
+serde_json = { version = "1", optional = true }
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }
+dirs = { version = "6", optional = true }
+
+[[bin]]
+name = "enenSU-Desktop"
+path = "src/desktop/main.rs"
+required-features = ["desktop"]
+
+[build-dependencies]
+embed-resource = { version = "3", optional = true }

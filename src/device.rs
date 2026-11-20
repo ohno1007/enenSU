@@ -4,11 +4,126 @@ use std::{
     fs::{File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
     io::{Read, Seek},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+#[derive(Clone)]
+pub struct PlatformTools {
+    adb: PathBuf,
+    fastboot: PathBuf,
+}
+
+impl Default for PlatformTools {
+    fn default() -> Self {
+        Self {
+            adb: "adb".into(),
+            fastboot: "fastboot".into(),
+        }
+    }
+}
+
+impl PlatformTools {
+    pub fn in_directory(dir: &Path) -> Self {
+        Self {
+            adb: dir.join("adb.exe"),
+            fastboot: dir.join("fastboot.exe"),
+        }
+    }
+
+    pub fn devices(&self) -> Result<Vec<DeviceInfo>> {
+        let timeout = Duration::from_secs(5);
+        let output = execute(Command::new(&self.adb).args(["devices", "-l"]), timeout)?
+            .checked("adb devices")?;
+        let mut rows = Vec::new();
+        for line in output.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(serial), Some(state)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            if !matches!(
+                state,
+                "device" | "unauthorized" | "offline" | "recovery" | "sideload"
+            ) {
+                continue;
+            }
+            let property = |args: &[&str]| -> Option<String> {
+                let reply = execute(
+                    Command::new(&self.adb)
+                        .args(["-s", serial, "shell"])
+                        .args(args),
+                    timeout,
+                )
+                .ok()?;
+                reply.status.success().then_some(reply.text)
+            };
+            let mut row = DeviceInfo {
+                serial: serial.into(),
+                state: state.into(),
+                model: fields
+                    .find_map(|f| f.strip_prefix("model:"))
+                    .unwrap_or("")
+                    .replace('_', " "),
+                ..Default::default()
+            };
+            if state == "device" {
+                let props = properties(&property(&["getprop"]).unwrap_or_default());
+                let prop = |key: &str| props.get(key).map(String::as_str).unwrap_or("");
+                if !prop("ro.product.model").is_empty() {
+                    row.model = prop("ro.product.model").into();
+                }
+                row.lock = boot_lock(&props);
+                row.slot = [prop("ro.boot.slot_suffix"), prop("ro.boot.slot")]
+                    .into_iter()
+                    .find(|s| !s.is_empty())
+                    .unwrap_or("")
+                    .trim_start_matches('_')
+                    .into();
+                row.kernel = property(&["uname", "-r"]).unwrap_or_default();
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+}
+
+#[derive(Default)]
+pub struct DeviceInfo {
+    pub serial: String,
+    pub state: String,
+    pub model: String,
+    pub kernel: String,
+    pub slot: String,
+    pub lock: Option<bool>, // true when locked, false when confirmed unlocked
+}
+
+fn boot_lock(props: &BTreeMap<String, String>) -> Option<bool> {
+    let prop = |key: &str| props.get(key).map(String::as_str).unwrap_or("");
+    let locked = prop("ro.boot.flash.locked");
+    let state = prop("ro.boot.vbmeta.device_state");
+    let verified = prop("ro.boot.verifiedbootstate");
+    if locked == "1" || state == "locked" || matches!(verified, "green" | "yellow") {
+        Some(true)
+    } else if locked == "0" || state == "unlocked" || verified == "orange" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verification {
+    Loaded,
+    Unverified,
+}
+
+#[derive(Clone, Debug)]
+pub struct Readback {
+    pub partition: String,
+    pub via: &'static str,
+}
 
 struct Reply {
     status: ExitStatus,
@@ -30,11 +145,23 @@ impl Reply {
 // Both tools can wait indefinitely for a missing device. Spool their output so a
 // verbose tool cannot fill a pipe while the host is waiting for the child.
 fn execute(cmd: &mut Command, limit: Duration) -> Result<Reply> {
+    execute_to(cmd, limit, None)
+}
+
+fn execute_to(cmd: &mut Command, limit: Duration, stdout: Option<File>) -> Result<Reply> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW for console subsystem tools.
+    }
     let mut log = tempfile::tempfile()?;
     let program = cmd.get_program().to_owned();
     let mut child = cmd
         .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
+        .stdout(match stdout {
+            Some(file) => file,
+            None => log.try_clone()?,
+        })
         .stderr(log.try_clone()?)
         .spawn()
         .with_context(|| {
@@ -119,13 +246,20 @@ pub struct Device {
     adb_unlocked: bool,
     timeout: Duration,
     _lock: File,
+    tools: PlatformTools,
 }
 
 impl Device {
-    pub fn connect(requested: Option<&str>, timeout: Duration) -> Result<Self> {
+    pub fn connect(
+        requested: Option<&str>,
+        timeout: Duration,
+        tools: PlatformTools,
+    ) -> Result<Self> {
         let short = timeout.min(Duration::from_secs(10));
-        execute(Command::new("fastboot").arg("--version"), short)?.checked("fastboot --version")?;
-        let list = execute(Command::new("adb").arg("devices"), short)?.checked("adb devices")?;
+        execute(Command::new(&tools.fastboot).arg("--version"), short)?
+            .checked("fastboot --version")?;
+        let list =
+            execute(Command::new(&tools.adb).arg("devices"), short)?.checked("adb devices")?;
         let ready = devices(&list, "device");
         let selected = match requested {
             Some(s) if ready.iter().any(|id| id == s) => s,
@@ -138,7 +272,7 @@ impl Device {
         }.to_owned();
         let shell = |args: &[&str]| {
             execute(
-                Command::new("adb")
+                Command::new(&tools.adb)
                     .args(["-s", &selected, "shell"])
                     .args(args),
                 short,
@@ -147,14 +281,12 @@ impl Device {
         };
         let props = properties(&shell(&["getprop"])?);
         let prop = |key: &str| props.get(key).map(String::as_str).unwrap_or("");
-        let locked = prop("ro.boot.flash.locked");
-        let state = prop("ro.boot.vbmeta.device_state");
-        let verified = prop("ro.boot.verifiedbootstate");
+        let lock_state = boot_lock(&props);
         ensure!(
-            locked != "1" && state != "locked" && !matches!(verified, "green" | "yellow"),
+            lock_state != Some(true),
             "bootloader is locked. Installation stopped"
         );
-        let adb_unlocked = locked == "0" || state == "unlocked" || verified == "orange";
+        let adb_unlocked = lock_state == Some(false);
         let adb_slot = slot(prop("ro.boot.slot_suffix"))?
             .or(slot(prop("ro.boot.slot"))?)
             .map(str::to_owned);
@@ -193,17 +325,18 @@ impl Device {
             adb_unlocked,
             timeout,
             _lock: lock,
+            tools,
         })
     }
 
     fn fastboot(&self) -> Command {
-        let mut cmd = Command::new("fastboot");
+        let mut cmd = Command::new(&self.tools.fastboot);
         cmd.args(["-s", &self.serial]);
         cmd
     }
 
     fn adb(&self) -> Command {
-        let mut cmd = Command::new("adb");
+        let mut cmd = Command::new(&self.tools.adb);
         cmd.args(["-s", &self.adb_serial]);
         cmd
     }
@@ -212,22 +345,25 @@ impl Device {
         self.timeout.min(Duration::from_secs(10))
     }
 
-    pub fn reboot_from_android(&self, fetch: bool) -> Result<()> {
-        let debuggable = self.props.get("ro.debuggable").is_some_and(|p| p == "1");
-        let dynamic = [
+    fn dynamic_partitions(&self) -> bool {
+        [
             "ro.boot.dynamic_partitions",
             "ro.boot.dynamic_partitions_retrofit",
         ]
         .iter()
-        .any(|k| self.props.get(*k).is_some_and(|v| v == "true" || v == "1"));
-        let mode = if fetch && debuggable && dynamic {
+        .any(|k| self.props.get(*k).is_some_and(|v| v == "true" || v == "1"))
+    }
+
+    pub fn reboot_from_android(&self, fetch: bool) -> Result<()> {
+        let debuggable = self.props.get("ro.debuggable").is_some_and(|p| p == "1");
+        let mode = if fetch && debuggable && self.dynamic_partitions() {
             "fastboot"
         } else {
             "bootloader"
         };
         println!("Rebooting {} to {mode}…", self.adb_serial);
         execute(self.adb().args(["reboot", mode]), self.short())?.checked("adb reboot")?;
-        self.wait_fastboot(false)
+        self.wait_fastboot(None)
     }
 
     pub fn getvar(&self, key: &str) -> Result<Option<String>> {
@@ -264,16 +400,19 @@ impl Device {
             .map(str::to_owned))
     }
 
-    fn wait_fastboot(&self, bootloader_only: bool) -> Result<()> {
+    fn wait_fastboot(&self, userspace: Option<bool>) -> Result<()> {
         let deadline = Instant::now() + self.timeout;
         loop {
-            let list = execute(Command::new("fastboot").arg("devices"), self.short())?
-                .checked("fastboot devices")?;
+            let list = execute(
+                Command::new(&self.tools.fastboot).arg("devices"),
+                self.short(),
+            )?
+            .checked("fastboot devices")?;
             if devices(&list, "fastboot").contains(&self.serial)
-                && (!bootloader_only
-                    || self
-                        .getvar("is-userspace")
-                        .is_ok_and(|s| s.as_deref() != Some("yes")))
+                && userspace.is_none_or(|expected| {
+                    self.getvar("is-userspace")
+                        .is_ok_and(|s| (s.as_deref() == Some("yes")) == expected)
+                })
             {
                 return Ok(());
             }
@@ -290,9 +429,26 @@ impl Device {
         if self.getvar("is-userspace")?.as_deref() == Some("yes") {
             execute(self.fastboot().args(["reboot", "bootloader"]), self.short())?
                 .checked("fastboot reboot bootloader")?;
-            self.wait_fastboot(true)?;
+            self.wait_fastboot(Some(false))?;
         }
         Ok(())
+    }
+
+    // Implementations can advertise fetch in only one of the two fastboot modes.
+    pub fn alternate_readback_mode(&self) -> Result<bool> {
+        match self.getvar("is-userspace")?.as_deref() {
+            Some("yes") => self.enter_bootloader()?,
+            Some("no") if self.dynamic_partitions() => {
+                let reply = execute(self.fastboot().args(["reboot", "fastboot"]), self.short())?;
+                if !reply.status.success() {
+                    eprintln!("fastbootd is unavailable: {}", reply.text);
+                    return Ok(false);
+                }
+                self.wait_fastboot(Some(true))?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     pub fn verify_target(&self) -> Result<Option<String>> {
@@ -341,14 +497,16 @@ impl Device {
         Ok((target, capacity))
     }
 
-    // Use the ordinary authorized sync service only for readable block nodes.
-    pub fn pull_image(&self, name: &str, out: &Path) -> Result<Option<String>> {
-        if !self.adb_unlocked
-            || (self.adb_slot.is_none()
-                && self
-                    .props
-                    .get("ro.build.ab_update")
-                    .is_some_and(|s| s == "true"))
+    // Read only nodes available to the ordinary, authorized Android shell.
+    pub fn pull_image(&self, name: &str, out: &Path) -> Result<Option<Readback>> {
+        // A read is authorized independently of fastboot. Some devices expose
+        // their bootloader lock state only once they enter fastboot; every write
+        // still goes through verify_target(). Never guess an A/B source slot.
+        if self.adb_slot.is_none()
+            && self
+                .props
+                .get("ro.build.ab_update")
+                .is_some_and(|s| s == "true")
         {
             return Ok(None);
         }
@@ -368,9 +526,28 @@ impl Device {
             println!("Reading {physical} using adb pull…");
             let reply = execute(self.adb().args(["pull", &node]).arg(out), self.timeout)?;
             if reply.status.success() && out.metadata().is_ok_and(|m| m.len() > 0) {
-                return Ok(Some(physical));
+                return Ok(Some(Readback {
+                    partition: physical,
+                    via: "adb pull",
+                }));
             }
-            eprintln!("ADB readback unavailable for {node}: {}", reply.text);
+            // Some sync servers cannot pull a readable block device. shell -T uses
+            // the same Android shell identity and keeps binary stdout separate from stderr.
+            let stream = execute_to(
+                self.adb().args(["shell", "-T", "cat", &node]),
+                self.timeout,
+                Some(File::create(out)?),
+            )?;
+            if stream.status.success() && out.metadata().is_ok_and(|m| m.len() > 0) {
+                return Ok(Some(Readback {
+                    partition: physical,
+                    via: "adb shell",
+                }));
+            }
+            eprintln!(
+                "ADB readback unavailable for {node}: {} {}",
+                reply.text, stream.text
+            );
             if out.exists() {
                 std::fs::remove_file(out)?;
             }
@@ -413,11 +590,15 @@ impl Device {
         Ok(())
     }
 
-    pub fn verify_boot(&self, names: &[String], expected_slot: Option<&str>) -> Result<()> {
+    pub fn verify_boot(
+        &self,
+        names: &[String],
+        expected_slot: Option<&str>,
+    ) -> Result<Verification> {
         let deadline = Instant::now() + self.timeout;
         println!("Waiting for Android on {}…", self.adb_serial);
         loop {
-            let list = execute(Command::new("adb").arg("devices"), self.short())?
+            let list = execute(Command::new(&self.tools.adb).arg("devices"), self.short())?
                 .checked("adb devices")?;
             if devices(&list, "device").contains(&self.adb_serial)
                 && let Ok(reply) = execute(self.adb().args(["shell", "getprop"]), self.short())
@@ -485,7 +666,7 @@ impl Device {
                     println!(
                         "Android booted. Stock ADB could not confirm {name}. Module loading is unverified."
                     );
-                    return Ok(());
+                    return Ok(Verification::Unverified);
                 }
             }
             println!(
@@ -493,6 +674,6 @@ impl Device {
                 names.join(", ")
             );
         }
-        Ok(())
+        Ok(Verification::Loaded)
     }
 }
