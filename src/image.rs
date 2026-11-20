@@ -2,7 +2,7 @@
 // Keep its ramdisk decode / replace / repack path, with Android's module list as payload.
 use android_bootimg::{
     layouts::{
-        AvbFooter, BOOT_HEADER_V3, BOOT_HEADER_V4, VENDOR_BOOT_HEADER_V3, VENDOR_BOOT_HEADER_V4,
+        BOOT_HEADER_V3, BOOT_HEADER_V4, VENDOR_BOOT_HEADER_V3, VENDOR_BOOT_HEADER_V4,
         VendorRamdiskTableEntryType as Kind,
     },
     parser::{BootHeader, BootImage, BootImageBlocks, BootImageVersion, RamdiskImage},
@@ -15,29 +15,79 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{archive::Archive, modules};
+use crate::{archive::Archive, avb, modules};
 
-/// Feed the repacker only the image payload. An AVB descriptor authenticates the *old* bytes.
-pub fn parse_image(input: &[u8]) -> Result<BootImage<'_>> {
-    let mut payload = input;
-    if let Some(data) = input
-        .last_chunk::<{ AvbFooter::SIZE }>()
-        .filter(|d| d.starts_with(b"AVBf"))
-    {
-        let footer = AvbFooter { data };
-        let size = usize::try_from(footer.get_original_image_size())?;
-        let offset = usize::try_from(footer.get_vbmeta_offset())?;
-        let end = offset
-            .checked_add(usize::try_from(footer.get_vbmeta_size())?)
-            .context("invalid AVB size")?;
-        ensure!(
-            size <= offset
-                && end <= input.len() - data.len()
-                && input[offset..end].starts_with(b"AVB0"),
-            "invalid AVB footer"
-        );
-        payload = &input[..size];
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    Boot,
+    InitBoot,
+    Vendor,
+}
+
+impl Layout {
+    fn accepts(self, target: &str) -> bool {
+        matches!(
+            (self, target),
+            (Self::Boot, "boot")
+                | (Self::InitBoot, "init_boot")
+                | (Self::Vendor, "vendor_boot" | "vendor_kernel_boot")
+        )
     }
+}
+
+pub struct ParsedImage<'a> {
+    boot: BootImage<'a>,
+    layout: Layout,
+    avb_partition: Option<&'a str>,
+}
+
+fn vendor_filename(path: &Path) -> Option<&'static str> {
+    let stem = path.file_stem()?.to_str()?;
+    ["vendor_boot", "vendor_kernel_boot"]
+        .into_iter()
+        .find(|name| {
+            stem.strip_prefix(name)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['-', '_', '.']))
+        })
+}
+
+impl<'image> ParsedImage<'image> {
+    fn partition_label(&self, path: &Path) -> Option<&'image str> {
+        match self.layout {
+            Layout::Vendor => self.avb_partition.or_else(|| vendor_filename(path)),
+            _ => self.avb_partition,
+        }
+    }
+
+    fn check_target(&self, target: &str, path: &Path) -> Result<()> {
+        ensure!(
+            self.layout.accepts(target),
+            "image header does not match partition {target}"
+        );
+        // The two vendor partitions share a header format. Prefer the AVB label;
+        // honor conventional factory filenames when the input is unsigned.
+        if let Some(label) = self.partition_label(path) {
+            ensure!(target == label, "image is labeled {label}, not {target}");
+        }
+        Ok(())
+    }
+
+    pub fn flash_target<'a>(&self, requested: Option<&'a str>, path: &Path) -> Result<&'a str> {
+        let target = match requested {
+            Some(target) => target,
+            None if self.partition_label(path) == Some("vendor_boot") => "vendor_boot",
+            None => bail!(
+                "specify --partition for the source firmware partition (boot, init_boot, vendor_boot or vendor_kernel_boot)"
+            ),
+        };
+        self.check_target(target, path)?;
+        Ok(target)
+    }
+}
+
+/// Feed the repacker only the original payload; its old AVB descriptor covers the old bytes.
+pub fn parse_image(input: &[u8]) -> Result<ParsedImage<'_>> {
+    let (payload, avb_partition) = avb::payload(input)?;
     let word = |offset: usize| -> Result<u32> {
         let bytes = payload
             .get(offset..offset + 4)
@@ -75,26 +125,33 @@ pub fn parse_image(input: &[u8]) -> Result<BootImage<'_>> {
         payload[end..].iter().all(|b| *b == 0),
         "unrecognized data after image sections (use the pre-signing device build artifact)"
     );
-    let image = BootImage::parse(&payload[..end])?;
-    ensure!(
-        partition(&image) == "vendor_boot" || image.get_blocks().get_kernel().is_some(),
-        "a boot partition image must contain a kernel; check the source partition"
-    );
-    Ok(image)
-}
-
-pub fn partition(image: &BootImage<'_>) -> &'static str {
-    if matches!(
-        image.get_header().get_version(),
-        BootImageVersion::Vendor(_)
-    ) {
-        "vendor_boot"
-    } else {
-        "boot"
+    let boot = BootImage::parse(&payload[..end])?;
+    let layout = match header.get_version() {
+        BootImageVersion::Vendor(_) => Layout::Vendor,
+        BootImageVersion::Android(_) if boot.get_blocks().get_kernel().is_some() => Layout::Boot,
+        BootImageVersion::Android(4) if boot.get_blocks().get_ramdisk().is_some() => {
+            Layout::InitBoot
+        }
+        _ => bail!("expected a kernel in boot or a nonempty v4 ramdisk in init_boot"),
+    };
+    if let Some(target) = avb_partition {
+        ensure!(
+            layout.accepts(target),
+            "unsupported or conflicting AVB partition label {target}"
+        );
     }
+    Ok(ParsedImage {
+        boot,
+        layout,
+        avb_partition,
+    })
 }
 
-fn extract(ramdisk: &RamdiskImage<'_>, fragment: Option<&str>) -> Result<(Vec<u8>, Option<usize>)> {
+fn extract(
+    ramdisk: &RamdiskImage<'_>,
+    fragment: Option<&str>,
+    flag: &str,
+) -> Result<(Vec<u8>, Option<usize>)> {
     let mut bytes = Vec::new();
     if !ramdisk.is_vendor_ramdisk() {
         ensure!(
@@ -127,7 +184,7 @@ fn extract(ramdisk: &RamdiskImage<'_>, fragment: Option<&str>) -> Result<(Vec<u8
             .iter()
             .map(|(_, e)| String::from_utf8_lossy(e.get_name_raw()))
             .collect();
-        bail!("select one normal-boot ramdisk with --fragment (matching names: {names:?})");
+        bail!("select one normal-boot ramdisk with {flag} (matching names: {names:?})");
     };
     entry.dump(&mut bytes, false)?;
     Ok((bytes, Some(*idx)))
@@ -150,21 +207,45 @@ fn other_normal_parts(rd: &RamdiskImage<'_>, index: Option<usize>) -> Result<Vec
     Ok(parts)
 }
 
-fn vendor_reference(path: &Path, fragment: Option<&str>) -> Result<Vec<Vec<u8>>> {
+fn vendor_reference(
+    path: &Path,
+    expected: &str,
+    fragment: Option<&str>,
+    flag: &str,
+) -> Result<Vec<Vec<u8>>> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let image = parse_image(&bytes)?;
-    ensure!(
-        partition(&image) == "vendor_boot",
-        "--vendor-boot expects a matching vendor_boot image"
-    );
-    let rd = image
-        .get_blocks()
-        .get_ramdisk()
-        .context("missing vendor ramdisk")?;
-    let (selected, index) = extract(rd, fragment)?;
+    let parsed = parse_image(&bytes)?;
+    parsed.check_target(expected, path)?;
+    let Some(rd) = parsed.boot.get_blocks().get_ramdisk() else {
+        ensure!(
+            fragment.is_none(),
+            "{expected} has no ramdisk fragment {fragment:?}"
+        );
+        return Ok(Vec::new());
+    };
+    if fragment.is_none()
+        && rd.is_vendor_ramdisk()
+        && !rd.iter_vendor_ramdisk().any(|p| {
+            matches!(
+                p.get_entry_type(),
+                Kind::None | Kind::Platform | Kind::Unknown(3)
+            )
+        })
+    {
+        return Ok(Vec::new());
+    }
+    let (selected, index) = extract(rd, fragment, flag)?;
     let mut parts = other_normal_parts(rd, index)?;
-    parts.push(selected);
+    if !selected.is_empty() {
+        parts.push(selected);
+    }
     Ok(parts)
+}
+
+pub struct VendorReferences<'a> {
+    pub boot: Option<&'a Path>,
+    pub kernel_boot: Option<&'a Path>,
+    pub boot_fragment: Option<&'a str>,
 }
 
 pub fn patch(
@@ -173,38 +254,54 @@ pub fn patch(
     enable: &[String],
     fragment: Option<&str>,
     module_dir: Option<&str>,
-    vendor_boot: Option<&Path>,
+    vendor: VendorReferences<'_>,
 ) -> Result<Option<Vec<u8>>> {
-    let image = parse_image(input)?;
-    let is_boot = partition(&image) == "boot";
+    let parsed = parse_image(input)?;
+    let is_generic = parsed.layout != Layout::Vendor;
+    let image = parsed.boot;
+    let has_reference = vendor.boot.is_some() || vendor.kernel_boot.is_some();
     ensure!(
-        is_boot || vendor_boot.is_none(),
-        "--vendor-boot is a read-only reference for patching boot"
+        is_generic || !has_reference,
+        "vendor reference images are for patching boot or init_boot"
     );
     if files.is_empty() && enable.is_empty() {
         return Ok(None);
     }
-    let ramdisk = image.get_blocks().get_ramdisk().context("this image has no ramdisk for first-stage modules; use the device's vendor_boot module tree")?;
-    let target_fragment = if is_boot && vendor_boot.is_some() {
-        None
-    } else {
-        fragment
-    };
-    let (mut raw, index) = extract(ramdisk, target_fragment)?;
+    let ramdisk = image.get_blocks().get_ramdisk().context("this image has no ramdisk for first-stage modules; use the device's init_boot or vendor module image")?;
+    let (mut raw, index) = extract(
+        ramdisk,
+        if has_reference { None } else { fragment },
+        "--fragment",
+    )?;
     let target = Archive::read(&raw).context("read ramdisk newc archive")?;
-    let parts = vendor_boot
-        .map(|path| vendor_reference(path, fragment))
-        .transpose()?;
-    let archive = match &parts {
-        Some(parts) => Archive::vendor_base(parts)?.with_generic(target),
-        None => target,
+    let mut parts = Vec::new();
+    if let Some(path) = vendor.boot {
+        let (select, flag) = if vendor.kernel_boot.is_some() {
+            (vendor.boot_fragment, "--vendor-boot-fragment")
+        } else {
+            (fragment, "--fragment")
+        };
+        parts.extend(vendor_reference(path, "vendor_boot", select, flag)?);
+    }
+    if let Some(path) = vendor.kernel_boot {
+        parts.extend(vendor_reference(
+            path,
+            "vendor_kernel_boot",
+            fragment,
+            "--fragment",
+        )?);
+    }
+    let archive = if parts.is_empty() {
+        target
+    } else {
+        Archive::vendor_base(&parts)?.with_generic(target)
     };
     let dir = archive.module_dir(module_dir)?;
-    if is_boot {
+    if is_generic {
         ensure!(
             archive.file(&format!("{dir}/modules.load"))?.is_some()
                 && archive.file(&format!("{dir}/modules.dep"))?.is_some(),
-            "no stock first-stage module lists at {dir}; provide the matching --vendor-boot image or select the device's --module-dir"
+            "no stock first-stage module lists at {dir}; provide the matching --vendor-boot or --vendor-kernel-boot image, or select the device's --module-dir"
         );
     }
     let edits = modules::plan(&archive, &dir, files, enable)?;
@@ -216,7 +313,7 @@ pub fn patch(
             if archive.file(path)? != Some(data) && peers.file(path)?.is_some_and(|old| old != data)
             {
                 bail!(
-                    "another vendor fragment supplies {path}; select its owner or patch boot with the matching --vendor-boot"
+                    "another vendor fragment supplies {path}; select its owner or patch the generic ramdisk with the matching vendor references"
                 );
             }
         }

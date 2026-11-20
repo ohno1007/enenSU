@@ -6,7 +6,6 @@ use flate2::{Compression, write::GzEncoder};
 use object::{Architecture, BinaryFormat, Endianness, SectionKind, write::Object};
 use std::{
     collections::BTreeSet,
-    ffi::OsStr,
     fs,
     io::Write,
     path::Path,
@@ -74,6 +73,35 @@ fn vendor(version: u8, fragments: &[(&str, usize, &[u8])]) -> Vec<u8> {
         bytes.resize(bytes.len().next_multiple_of(PAGE), 0);
     }
     bytes
+}
+
+// AVB hash descriptor and footer in the AOSP on-disk format, without a signing key.
+fn labeled(mut payload: Vec<u8>, partition: &str) -> Vec<u8> {
+    let original = payload.len() as u64;
+    let body_length = (116 + partition.len()).next_multiple_of(8);
+    let mut descriptor = vec![0; 16 + body_length];
+    descriptor[..8].copy_from_slice(&2u64.to_be_bytes());
+    descriptor[8..16].copy_from_slice(&(body_length as u64).to_be_bytes());
+    descriptor[16..24].copy_from_slice(&original.to_be_bytes());
+    descriptor[56..60].copy_from_slice(&(partition.len() as u32).to_be_bytes());
+    descriptor[132..132 + partition.len()].copy_from_slice(partition.as_bytes());
+
+    let aux_size = descriptor.len().next_multiple_of(64);
+    let mut metadata = vec![0; 256 + aux_size];
+    metadata[..4].copy_from_slice(b"AVB0");
+    metadata[4..8].copy_from_slice(&1u32.to_be_bytes());
+    metadata[20..28].copy_from_slice(&(aux_size as u64).to_be_bytes());
+    metadata[104..112].copy_from_slice(&(descriptor.len() as u64).to_be_bytes());
+    metadata[256..256 + descriptor.len()].copy_from_slice(&descriptor);
+    payload.extend_from_slice(&metadata);
+    let mut footer = [0; 64];
+    footer[..4].copy_from_slice(b"AVBf");
+    footer[4..8].copy_from_slice(&1u32.to_be_bytes());
+    footer[12..20].copy_from_slice(&original.to_be_bytes());
+    footer[20..28].copy_from_slice(&original.to_be_bytes());
+    footer[28..36].copy_from_slice(&(metadata.len() as u64).to_be_bytes());
+    payload.extend(footer);
+    payload
 }
 
 fn invoke(root: &Path, args: &[&str]) -> Output {
@@ -257,43 +285,73 @@ fn flash_validates_the_requested_partition_and_propagates_fastboot_status() {
     )
     .unwrap();
     fs::set_permissions(&fastboot, fs::Permissions::from_mode(0o755)).unwrap();
-    let run = |file: &OsStr, partition: &str, result: &str| {
-        Command::new(env!("CARGO_BIN_EXE_enensu"))
-            .args(["flash", "-s", "device", "--partition", partition])
-            .arg(file)
+    let run = |file: &Path, partition: Option<&str>, result: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_enensu"));
+        cmd.args(["flash", "-s", "device"]);
+        if let Some(partition) = partition {
+            cmd.args(["--partition", partition]);
+        }
+        cmd.arg(file)
             .env("PATH", dir)
             .env("FASTBOOT_RESULT", result)
             .current_dir(dir)
             .output()
             .unwrap()
     };
-    assert!(!run(img.as_os_str(), "vendor_boot", "9").status.success());
-    assert_eq!(
-        fs::read_to_string(dir.join("trace")).unwrap(),
-        format!(
-            "-s\ndevice\nflash\nvendor_boot\n{}\n",
-            img.canonicalize().unwrap().display()
-        )
-    );
-    fs::remove_file(dir.join("trace")).unwrap();
-    assert!(!run(img.as_os_str(), "boot", "0").status.success());
-    assert!(!dir.join("trace").exists());
+    let trace = dir.join("trace");
+    let check_trace = |file: &Path, partition: &str| {
+        assert_eq!(
+            fs::read_to_string(&trace).unwrap(),
+            format!(
+                "-s\ndevice\nflash\n{partition}\n{}\n",
+                file.canonicalize().unwrap().display()
+            )
+        );
+        fs::remove_file(&trace).unwrap();
+    };
+    assert!(!run(&img, Some("vendor_boot"), "9").status.success());
+    check_trace(&img, "vendor_boot");
     let generic = dir.join("boot.img");
     fs::write(&generic, boot(3, b"kernel", &archive(&[]), &[])).unwrap();
-    assert!(
-        !run(generic.as_os_str(), "vendor_boot", "0")
-            .status
-            .success()
-    );
-    assert!(!dir.join("trace").exists());
-    assert!(run(generic.as_os_str(), "boot", "0").status.success());
-    assert_eq!(
-        fs::read_to_string(dir.join("trace")).unwrap(),
-        format!(
-            "-s\ndevice\nflash\nboot\n{}\n",
-            generic.canonicalize().unwrap().display()
-        )
-    );
+    let init = dir.join("ramdisk.img");
+    fs::write(
+        &init,
+        labeled(boot(4, &[], &archive(&[]), &[]), "init_boot"),
+    )
+    .unwrap();
+    let drivers = dir.join("renamed.img");
+    let vendor_bytes = fs::read(&img).unwrap();
+    fs::write(
+        &drivers,
+        labeled(vendor_bytes.clone(), "vendor_kernel_boot"),
+    )
+    .unwrap();
+    let named = dir.join("vendor_boot-final.img");
+    fs::write(&named, &vendor_bytes).unwrap();
+    for (file, partition) in [
+        (&img, None),
+        (&img, Some("boot")),
+        (&generic, Some("vendor_boot")),
+        (&generic, Some("init_boot")),
+        (&init, Some("boot")),
+        (&init, None),
+        (&drivers, Some("vendor_boot")),
+        (&drivers, None),
+        (&named, Some("vendor_kernel_boot")),
+    ] {
+        assert!(!run(file, partition, "0").status.success());
+        assert!(!trace.exists());
+    }
+    for (file, partition, expected) in [
+        (&generic, Some("boot"), "boot"),
+        (&init, Some("init_boot"), "init_boot"),
+        (&drivers, Some("vendor_kernel_boot"), "vendor_kernel_boot"),
+        (&named, None, "vendor_boot"),
+        (&img, Some("vendor_kernel_boot"), "vendor_kernel_boot"),
+    ] {
+        assert!(run(file, partition, "0").status.success());
+        check_trace(file, expected);
+    }
 }
 
 #[test]
@@ -304,18 +362,7 @@ fn preserve_avb_on_a_noop_and_return_a_signable_payload_on_change() {
         ("lib/modules/modules.dep", b"stock.ko:\n"),
         ("lib/modules/stock.ko", &module("stock", "")),
     ]);
-    let mut signed = vendor(3, &[("", 0, &raw)]);
-    let payload_size = signed.len() as u64;
-    signed.extend_from_slice(b"AVB0");
-    signed.resize(signed.len() + 4096, 0);
-    // Metadata layout only. Cryptographic signing belongs to the device build.
-    let mut footer = [0; 64];
-    footer[..4].copy_from_slice(b"AVBf");
-    footer[4..8].copy_from_slice(&1u32.to_be_bytes());
-    footer[12..20].copy_from_slice(&payload_size.to_be_bytes());
-    footer[20..28].copy_from_slice(&payload_size.to_be_bytes());
-    footer[28..36].copy_from_slice(&256u64.to_be_bytes());
-    signed.extend(footer);
+    let signed = labeled(vendor(3, &[("", 0, &raw)]), "vendor_boot");
     fs::write(dir.join("signed.img"), &signed).unwrap();
     assert_eq!(patch(dir, "signed.img", "copy.img", &[]), signed);
     let changed = patch(dir, "signed.img", "payload.img", &["--enable", "stock"]);
@@ -511,12 +558,237 @@ fn boot_uses_the_factory_vendor_lists_without_writing_the_companion() {
 }
 
 #[test]
+fn init_boot_keeps_the_stock_init_and_combines_both_vendor_partition_lists() {
+    let temp = tempdir().unwrap();
+    let dir = temp.path();
+    let init = archive(&[("init", b"stock init")]);
+    let base = labeled(boot(4, &[], &init, &[]), "init_boot");
+    fs::write(dir.join("init_boot.img"), &base).unwrap();
+    let platform = archive(&[("lib/modules/modules.load", b"stock.ko\n")]);
+    let other_board = archive(&[("lib/modules/modules.load", b"other.ko\n")]);
+    let vendor_boot = labeled(
+        vendor(
+            4,
+            &[("board_a", 3, &other_board), ("board_b", 3, &platform)],
+        ),
+        "vendor_boot",
+    );
+    fs::write(dir.join("vendor_boot.img"), &vendor_boot).unwrap();
+    let stock = module("stock", "");
+    let drivers = archive(&[
+        ("lib/modules/modules.dep", b"stock.ko:\n"),
+        ("lib/modules/stock.ko", &stock),
+    ]);
+    let vendor_kernel = labeled(
+        vendor(
+            4,
+            &[("different", 3, &other_board), ("drivers", 3, &drivers)],
+        ),
+        "vendor_kernel_boot",
+    );
+    fs::write(dir.join("drivers.img"), &vendor_kernel).unwrap();
+    let sensor = module("sensor", "stock");
+    fs::write(dir.join("sensor.ko"), &sensor).unwrap();
+    let select = [
+        "--module",
+        "sensor.ko",
+        "--vendor-boot",
+        "vendor_boot.img",
+        "--vendor-kernel-boot",
+        "drivers.img",
+        "--fragment",
+        "drivers",
+        "--vendor-boot-fragment",
+        "board_b",
+    ];
+
+    assert_eq!(patch(dir, "init_boot.img", "copy.img", &[]), base);
+    let mut incomplete = vec!["patch", "init_boot.img", "-o", "unselected.img"];
+    incomplete.extend_from_slice(&select[..select.len() - 2]);
+    let error = invoke(dir, &incomplete);
+    assert!(
+        !error.status.success()
+            && String::from_utf8_lossy(&error.stderr).contains("--vendor-boot-fragment")
+    );
+    assert!(!dir.join("unselected.img").exists());
+    let changed = patch(dir, "init_boot.img", "init-patched.img", &select);
+    let image = BootImage::parse(&changed).unwrap();
+    assert!(image.get_blocks().get_kernel().is_none());
+    let raw = image.get_blocks().get_ramdisk().unwrap().get_data();
+    assert!(raw.starts_with(&init));
+    let cpio = Cpio::load_from_data(raw).unwrap();
+    let bytes = |p| cpio.entry_by_name(p).unwrap().data().unwrap();
+    assert_eq!(bytes("init"), b"stock init");
+    assert_eq!(bytes("lib/modules/sensor.ko"), sensor);
+    assert_eq!(
+        bytes("lib/modules/modules.dep"),
+        b"stock.ko:\nsensor.ko: stock.ko\n"
+    );
+    assert_eq!(bytes("lib/modules/modules.load"), b"stock.ko\nsensor.ko\n");
+    assert!(!cpio.exists("lib/modules/stock.ko"));
+    assert_eq!(
+        patch(dir, "init-patched.img", "again.img", &select),
+        changed
+    );
+    assert_eq!(fs::read(dir.join("vendor_boot.img")).unwrap(), vendor_boot);
+    assert_eq!(fs::read(dir.join("drivers.img")).unwrap(), vendor_kernel);
+    let wrong = invoke(
+        dir,
+        &[
+            "patch",
+            "init_boot.img",
+            "-o",
+            "bad.img",
+            "--enable",
+            "stock",
+            "--vendor-boot",
+            "drivers.img",
+        ],
+    );
+    assert!(!wrong.status.success());
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("labeled vendor_kernel_boot"));
+    assert!(!dir.join("bad.img").exists());
+}
+
+#[test]
+fn separate_vendor_driver_image_works_directly_or_alongside_a_recovery_only_reference() {
+    let temp = tempdir().unwrap();
+    let dir = temp.path();
+    let stock = module("stock", "");
+    let drivers = archive(&[
+        ("lib/modules/modules.load", b"# original\n"),
+        ("lib/modules/modules.dep", b"stock.ko:\n"),
+        ("lib/modules/stock.ko", &stock),
+    ]);
+    let factory = labeled(vendor(4, &[("", 0, &drivers)]), "vendor_kernel_boot");
+    fs::write(dir.join("vendor_kernel_boot.img"), &factory).unwrap();
+    let select = ["--enable", "stock"];
+    let patched = patch(
+        dir,
+        "vendor_kernel_boot.img",
+        "drivers-patched.img",
+        &select,
+    );
+    let parsed = BootImage::parse(&patched).unwrap();
+    let fragment = parsed
+        .get_blocks()
+        .get_ramdisk()
+        .unwrap()
+        .get_vendor_ramdisk(0)
+        .unwrap();
+    let tree = Cpio::load_from_data(fragment.get_data()).unwrap();
+    assert_eq!(
+        tree.entry_by_name("lib/modules/modules.load")
+            .unwrap()
+            .data()
+            .unwrap(),
+        b"# original\nstock.ko\n"
+    );
+    assert_eq!(
+        tree.entry_by_name("lib/modules/stock.ko")
+            .unwrap()
+            .data()
+            .unwrap(),
+        stock
+    );
+    assert_eq!(
+        patch(dir, "drivers-patched.img", "again.img", &select),
+        patched
+    );
+
+    fs::write(
+        dir.join("init_boot.img"),
+        boot(4, &[], &archive(&[("init", b"init")]), &[]),
+    )
+    .unwrap();
+    let recovery = archive(&[("lib/modules/modules.load", b"recovery.ko\n")]);
+    fs::write(
+        dir.join("vendor_boot.img"),
+        vendor(4, &[("rescue", 2, &recovery)]),
+    )
+    .unwrap();
+    let generic = patch(
+        dir,
+        "init_boot.img",
+        "init-patched.img",
+        &[
+            "--enable",
+            "stock",
+            "--vendor-boot",
+            "vendor_boot.img",
+            "--vendor-kernel-boot",
+            "vendor_kernel_boot.img",
+        ],
+    );
+    let image = BootImage::parse(&generic).unwrap();
+    let tree = Cpio::load_from_data(image.get_blocks().get_ramdisk().unwrap().get_data()).unwrap();
+    assert_eq!(
+        tree.entry_by_name("lib/modules/modules.load")
+            .unwrap()
+            .data()
+            .unwrap(),
+        b"# original\nstock.ko\n"
+    );
+    assert_eq!(
+        fs::read(dir.join("vendor_kernel_boot.img")).unwrap(),
+        factory
+    );
+    fs::write(
+        dir.join("vendor_boot-conflict.img"),
+        vendor(4, &[("platform", 1, &recovery)]),
+    )
+    .unwrap();
+    let bad = invoke(
+        dir,
+        &[
+            "patch",
+            "init_boot.img",
+            "-o",
+            "conflict.img",
+            "--enable",
+            "stock",
+            "--vendor-boot",
+            "vendor_boot-conflict.img",
+            "--vendor-kernel-boot",
+            "vendor_kernel_boot.img",
+        ],
+    );
+    assert!(
+        !bad.status.success()
+            && String::from_utf8_lossy(&bad.stderr).contains("conflicting vendor")
+    );
+    assert!(!dir.join("conflict.img").exists());
+}
+
+#[test]
+fn invalid_avb_lengths_and_partition_mismatches_fail_without_output() {
+    let temp = tempdir().unwrap();
+    let dir = temp.path();
+    let raw = vendor(4, &[("base", 1, &archive(&[]))]);
+    let mut broken = labeled(raw.clone(), "vendor_boot");
+    let descriptor_size = raw.len() + 256 + 8;
+    broken[descriptor_size..descriptor_size + 8].copy_from_slice(&u64::MAX.to_be_bytes());
+    for (image, message) in [
+        (broken, "AVB descriptor"),
+        (labeled(raw, "init_boot"), "AVB partition label"),
+    ] {
+        fs::write(dir.join("source.img"), image).unwrap();
+        let error = invoke(dir, &["patch", "source.img", "-o", "bad.img"]);
+        assert!(
+            !error.status.success() && String::from_utf8_lossy(&error.stderr).contains(message)
+        );
+        assert!(!dir.join("bad.img").exists());
+    }
+}
+
+#[test]
 fn boot_layouts_without_a_ramdisk_or_kernel_fail_before_output() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
     for (input, expected) in [
         (boot(4, b"kernel", &[], &[]), "no ramdisk"),
-        (boot(4, &[], &archive(&[]), &[]), "must contain a kernel"),
+        (boot(3, &[], &archive(&[]), &[]), "expected a kernel"),
+        (boot(4, &[], &[], &[]), "expected a kernel"),
     ] {
         fs::write(dir.join("boot.img"), input).unwrap();
         let run = invoke(

@@ -1,4 +1,5 @@
 mod archive;
+mod avb;
 mod image;
 mod modules;
 
@@ -15,7 +16,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Prepare a boot or vendor_boot image offline. With no selection, make an exact copy.
+    /// Prepare a generic or vendor boot image offline. With no selection, make an exact copy.
     Patch {
         image: PathBuf,
         /// Write to a new file.
@@ -27,10 +28,16 @@ enum Action {
         /// Enable a module already indexed in the first-stage ramdisk.
         #[arg(long, value_name = "NAME")]
         enable: Vec<String>,
-        /// Read the stock module tree from the matching vendor_boot when patching boot.
+        /// Read stock module data from vendor_boot when patching boot or init_boot.
         #[arg(long, value_name = "IMAGE")]
         vendor_boot: Option<PathBuf>,
-        /// Select a named normal-boot vendor ramdisk fragment (v4).
+        /// Read the separate vendor_kernel_boot when the firmware supplies one.
+        #[arg(long, value_name = "IMAGE")]
+        vendor_kernel_boot: Option<PathBuf>,
+        /// With both reference images, select a named fragment in vendor_boot.
+        #[arg(long, value_name = "NAME", requires_all = ["vendor_boot", "vendor_kernel_boot"])]
+        vendor_boot_fragment: Option<String>,
+        /// Select a normal-boot vendor fragment (v4). With two references, selects vendor_kernel_boot.
         #[arg(long)]
         fragment: Option<String>,
         /// Select a module directory, e.g. lib/modules/6.1, if the image has several.
@@ -40,9 +47,9 @@ enum Action {
     /// Use Android Platform Tools to flash a prepared image to its partition.
     Flash {
         image: PathBuf,
-        /// Target partition. Explicitly select boot when flashing a boot image.
-        #[arg(long, value_parser = ["boot", "vendor_boot"], default_value = "vendor_boot")]
-        partition: String,
+        /// Source firmware partition. Defaults to vendor_boot only for images identified as vendor_boot.
+        #[arg(long, value_parser = ["boot", "init_boot", "vendor_boot", "vendor_kernel_boot"])]
+        partition: Option<String>,
         /// Fastboot device serial. Uses fastboot's default device selection if omitted.
         #[arg(short, long)]
         serial: Option<String>,
@@ -59,6 +66,8 @@ fn main() -> Result<()> {
             fragment,
             module_dir,
             vendor_boot,
+            vendor_kernel_boot,
+            vendor_boot_fragment,
         } => {
             let source = fs::read(&image).with_context(|| format!("read {}", image.display()))?;
             let patched = image::patch(
@@ -67,7 +76,11 @@ fn main() -> Result<()> {
                 &enable,
                 fragment.as_deref(),
                 module_dir.as_deref(),
-                vendor_boot.as_deref(),
+                image::VendorReferences {
+                    boot: vendor_boot.as_deref(),
+                    kernel_boot: vendor_kernel_boot.as_deref(),
+                    boot_fragment: vendor_boot_fragment.as_deref(),
+                },
             )?;
             let destination = output
                 .parent()
@@ -92,20 +105,17 @@ fn main() -> Result<()> {
             serial,
             partition,
         } => {
-            let image = image.canonicalize()?;
-            let bytes = fs::read(&image)?;
-            let detected = image::partition(&image::parse_image(&bytes)?);
-            ensure!(
-                detected == partition,
-                "image is for {detected}; select --partition {detected}"
-            );
+            let file = image.canonicalize()?;
+            let bytes = fs::read(&file)?;
+            let parsed = image::parse_image(&bytes)?;
+            let partition = parsed.flash_target(partition.as_deref(), &image)?;
             let mut fastboot = Command::new("fastboot");
             if let Some(serial) = serial {
                 fastboot.args(["-s", &serial]);
             }
             let status = fastboot
-                .args(["flash", &partition])
-                .arg(image)
+                .args(["flash", partition])
+                .arg(file)
                 .status()
                 .context("start fastboot from Android SDK Platform Tools")?;
             ensure!(

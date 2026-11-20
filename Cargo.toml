@@ -3,7 +3,7 @@ name = "enensu"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "Patch optional kernel modules into Android boot and vendor_boot images"
+description = "Patch optional kernel modules into Android first-stage boot ramdisks"
 
 [dependencies]
 # Same image parser and repacker as KernelSU v3.3.1 (userspace/ksud/Cargo.toml).
