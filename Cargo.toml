@@ -1,0 +1,19 @@
+[package]
+name = "enensu"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Patch optional kernel modules into Android boot and vendor_boot images"
+
+[dependencies]
+# Same image parser and repacker as KernelSU v3.3.1 (userspace/ksud/Cargo.toml).
+android-bootimg = { git = "https://github.com/5ec1cff/android_bootimg", rev = "150425b027c76ea104c82e408571651f2181b2c2" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpio = "0.4.2"
+object = { version = "0.41", default-features = false, features = ["std", "read_core", "elf", "unaligned"] }
+tempfile = "3"
+
+[dev-dependencies]
+flate2 = "1"
+object = { version = "0.41", default-features = false, features = ["write_std", "elf"] }
