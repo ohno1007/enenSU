@@ -1,0 +1,2 @@
+400cdfd72599eda9eb7edede78adffda69ab2d376936af1e50f700fddec40e7a  enensu-v0.2.0-linux-x64.tar.gz
+8ccc79ad1914904b2e2d497700bc528a9696041a4030d8e792a6fffa2382b404  enensu-v0.2.0-windows-x64.zip
