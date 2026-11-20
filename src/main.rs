@@ -1,6 +1,8 @@
 mod archive;
 mod avb;
+mod device;
 mod image;
+mod install;
 mod modules;
 
 use anyhow::{Context, Result, ensure};
@@ -16,6 +18,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Select drivers, patch the connected unlocked phone's image, flash its current slot and reboot.
+    Install(install::Options),
     /// Prepare a generic or vendor boot image offline. With no selection, make an exact copy.
     Patch {
         image: PathBuf,
@@ -58,6 +62,7 @@ enum Action {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Action::Install(options) => install::run(options)?,
         Action::Patch {
             image,
             output,

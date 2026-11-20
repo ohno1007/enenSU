@@ -237,7 +237,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "enensu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "android-bootimg",
  "anyhow",
@@ -246,6 +246,7 @@ dependencies = [
  "flate2",
  "object",
  "tempfile",
+ "tinyfiledialogs",
 ]
 
 [[package]]
@@ -549,6 +550,16 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "tinyfiledialogs"
+version = "3.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e25fa0bc43a6566e2cc6d7ac96df3fa5a57beba34445bead1b368ba8fe9ca568"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

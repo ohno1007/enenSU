@@ -72,6 +72,74 @@ impl Module {
     }
 }
 
+fn kernel_family(release: &str) -> Option<(u32, u32)> {
+    let mut numbers = release.split(['.', '-']);
+    Some((numbers.next()?.parse().ok()?, numbers.next()?.parse().ok()?))
+}
+
+fn android_kmi(release: &str) -> Option<(&str, Option<u32>)> {
+    let mut fields = release.split('-');
+    let version = fields.find_map(|s| {
+        s.strip_prefix("android")
+            .filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+    })?;
+    Some((version, fields.next().and_then(|s| s.parse().ok())))
+}
+
+/// Reject detectable architecture/KMI mismatches before rebooting an attached device.
+pub fn check_device(bytes: &[u8], filename: &str, machine: &str, kernel: &str) -> Result<String> {
+    let module = Module::parse(bytes)?;
+    ensure!(
+        filename.ends_with(".ko") && name(filename) == module.name,
+        "{filename} must match internal module name {}",
+        module.name
+    );
+    let arch = match machine {
+        "aarch64" | "arm64" => Architecture::Aarch64,
+        "x86_64" => Architecture::X86_64,
+        "i386" | "i486" | "i586" | "i686" => Architecture::I386,
+        "riscv64" => Architecture::Riscv64,
+        m if m.starts_with("armv") => Architecture::Arm,
+        _ => bail!("unrecognized device architecture {machine}"),
+    };
+    ensure!(
+        module.arch == arch,
+        "{filename} architecture does not match {machine}"
+    );
+    let mut fields = module.vermagic.split_whitespace();
+    let release = fields.next().context("empty module vermagic")?;
+    if release != kernel {
+        ensure!(
+            fields.any(|word| word == "modversions")
+                && kernel_family(release).is_some()
+                && kernel_family(release) == kernel_family(kernel),
+            "{filename} targets {release}, device runs {kernel}"
+        );
+        if let (Some((android, generation)), Some((device_android, device_generation))) =
+            (android_kmi(release), android_kmi(kernel))
+        {
+            ensure!(
+                android == device_android
+                    && (generation.is_none()
+                        || device_generation.is_none()
+                        || generation == device_generation),
+                "{filename} KMI {release} differs from device {kernel}"
+            );
+        }
+        if let (Some(page), Some(device_page)) =
+            (release.rsplit('-').next(), kernel.rsplit('-').next())
+        {
+            ensure!(
+                !(matches!(page, "4k" | "16k" | "64k")
+                    && matches!(device_page, "4k" | "16k" | "64k")
+                    && page != device_page),
+                "{filename} page size differs from device {kernel}"
+            );
+        }
+    }
+    Ok(module.name)
+}
+
 struct Indexed {
     path: String,
     depends: Vec<String>,

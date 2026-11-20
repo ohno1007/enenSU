@@ -824,3 +824,7 @@ fn vendor_patch_does_not_shadow_a_factory_list_in_another_fragment() {
     );
     assert!(!dir.join("bad.img").exists());
 }
+
+#[cfg(unix)]
+#[path = "install/mod.rs"]
+mod installation;

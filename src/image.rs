@@ -38,7 +38,7 @@ impl Layout {
 pub struct ParsedImage<'a> {
     boot: BootImage<'a>,
     layout: Layout,
-    avb_partition: Option<&'a str>,
+    pub avb: avb::Metadata<'a>,
 }
 
 fn vendor_filename(path: &Path) -> Option<&'static str> {
@@ -54,12 +54,12 @@ fn vendor_filename(path: &Path) -> Option<&'static str> {
 impl<'image> ParsedImage<'image> {
     fn partition_label(&self, path: &Path) -> Option<&'image str> {
         match self.layout {
-            Layout::Vendor => self.avb_partition.or_else(|| vendor_filename(path)),
-            _ => self.avb_partition,
+            Layout::Vendor => self.avb.partition.or_else(|| vendor_filename(path)),
+            _ => self.avb.partition,
         }
     }
 
-    fn check_target(&self, target: &str, path: &Path) -> Result<()> {
+    pub fn check_target(&self, target: &str, path: &Path) -> Result<()> {
         ensure!(
             self.layout.accepts(target),
             "image header does not match partition {target}"
@@ -70,6 +70,59 @@ impl<'image> ParsedImage<'image> {
             ensure!(target == label, "image is labeled {label}, not {target}");
         }
         Ok(())
+    }
+
+    pub fn source_partition(&self, path: &Path) -> Result<&str> {
+        match self.layout {
+            Layout::Boot => Ok("boot"),
+            Layout::InitBoot => Ok("init_boot"),
+            Layout::Vendor => self.partition_label(path).context(
+                "vendor image has no partition label or standard filename; specify --partition",
+            ),
+        }
+    }
+
+    pub fn has_ramdisk(&self) -> bool {
+        self.boot.get_blocks().get_ramdisk().is_some()
+    }
+
+    /// Find the native normal-boot module list before choosing a partition to flash.
+    pub fn stock_module_dir(
+        &self,
+        fragment: Option<&str>,
+        requested: Option<&str>,
+        kernel: &str,
+    ) -> Result<Option<String>> {
+        let Some(rd) = self.boot.get_blocks().get_ramdisk() else {
+            return Ok(None);
+        };
+        if fragment.is_none()
+            && rd.is_vendor_ramdisk()
+            && !rd
+                .iter_vendor_ramdisk()
+                .any(|p| normal_fragment(p.get_entry_type()))
+        {
+            return Ok(None);
+        }
+        let (raw, _) = extract(rd, fragment, "--fragment")?;
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let archive = Archive::read(&raw)?;
+        let release_dir = format!("lib/modules/{kernel}");
+        let requested = match requested {
+            None if archive
+                .file(&format!("{release_dir}/modules.load"))?
+                .is_some() =>
+            {
+                Some(release_dir.as_str())
+            }
+            other => other,
+        };
+        let dir = archive.module_dir(requested)?;
+        Ok((archive.file(&format!("{dir}/modules.dep"))?.is_some()
+            && archive.file(&format!("{dir}/modules.load"))?.is_some())
+        .then_some(dir))
     }
 
     pub fn flash_target<'a>(&self, requested: Option<&'a str>, path: &Path) -> Result<&'a str> {
@@ -87,7 +140,7 @@ impl<'image> ParsedImage<'image> {
 
 /// Feed the repacker only the original payload; its old AVB descriptor covers the old bytes.
 pub fn parse_image(input: &[u8]) -> Result<ParsedImage<'_>> {
-    let (payload, avb_partition) = avb::payload(input)?;
+    let (payload, avb) = avb::payload(input)?;
     let word = |offset: usize| -> Result<u32> {
         let bytes = payload
             .get(offset..offset + 4)
@@ -134,17 +187,17 @@ pub fn parse_image(input: &[u8]) -> Result<ParsedImage<'_>> {
         }
         _ => bail!("expected a kernel in boot or a nonempty v4 ramdisk in init_boot"),
     };
-    if let Some(target) = avb_partition {
+    if let Some(target) = avb.partition {
         ensure!(
             layout.accepts(target),
             "unsupported or conflicting AVB partition label {target}"
         );
     }
-    Ok(ParsedImage {
-        boot,
-        layout,
-        avb_partition,
-    })
+    Ok(ParsedImage { boot, layout, avb })
+}
+
+fn normal_fragment(kind: Kind) -> bool {
+    matches!(kind, Kind::None | Kind::Platform | Kind::Unknown(3))
 }
 
 fn extract(
@@ -166,10 +219,8 @@ fn extract(
         .iter_vendor_ramdisk()
         .enumerate()
         .filter(|(_, entry)| {
-            matches!(
-                entry.get_entry_type(),
-                Kind::None | Kind::Platform | Kind::Unknown(3)
-            ) && fragment.is_none_or(|name| name.as_bytes() == entry.get_name_raw())
+            normal_fragment(entry.get_entry_type())
+                && fragment.is_none_or(|name| name.as_bytes() == entry.get_name_raw())
         })
         .collect();
     if fragment.is_none()
@@ -225,12 +276,9 @@ fn vendor_reference(
     };
     if fragment.is_none()
         && rd.is_vendor_ramdisk()
-        && !rd.iter_vendor_ramdisk().any(|p| {
-            matches!(
-                p.get_entry_type(),
-                Kind::None | Kind::Platform | Kind::Unknown(3)
-            )
-        })
+        && !rd
+            .iter_vendor_ramdisk()
+            .any(|p| normal_fragment(p.get_entry_type()))
     {
         return Ok(Vec::new());
     }
@@ -247,6 +295,20 @@ pub struct VendorReferences<'a> {
     pub kernel_boot: Option<&'a Path>,
     pub boot_fragment: Option<&'a str>,
 }
+
+#[derive(Debug)]
+pub struct MissingStockLists(String);
+
+impl std::fmt::Display for MissingStockLists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no stock first-stage module lists at {}; provide the matching --vendor-boot or --vendor-kernel-boot image, or select the device's --module-dir",
+            self.0
+        )
+    }
+}
+impl std::error::Error for MissingStockLists {}
 
 pub fn patch(
     input: &[u8],
@@ -297,12 +359,11 @@ pub fn patch(
         Archive::vendor_base(&parts)?.with_generic(target)
     };
     let dir = archive.module_dir(module_dir)?;
-    if is_generic {
-        ensure!(
-            archive.file(&format!("{dir}/modules.load"))?.is_some()
-                && archive.file(&format!("{dir}/modules.dep"))?.is_some(),
-            "no stock first-stage module lists at {dir}; provide the matching --vendor-boot or --vendor-kernel-boot image, or select the device's --module-dir"
-        );
+    if is_generic
+        && (archive.file(&format!("{dir}/modules.load"))?.is_none()
+            || archive.file(&format!("{dir}/modules.dep"))?.is_none())
+    {
+        return Err(MissingStockLists(dir).into());
     }
     let edits = modules::plan(&archive, &dir, files, enable)?;
     if index.is_some() {

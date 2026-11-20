@@ -1,6 +1,6 @@
 [package]
 name = "enensu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Patch optional kernel modules into Android first-stage boot ramdisks"
@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 cpio = "0.4.2"
 object = { version = "0.41", default-features = false, features = ["std", "read_core", "elf", "unaligned"] }
 tempfile = "3"
+tinyfiledialogs = "3.9.1"
 
 [dev-dependencies]
 flate2 = "1"
